@@ -10,11 +10,11 @@ server_host: 127.0.0.1
 server_port: 5001
 # How long to wait for the server to come up (model load can be slow).
 connect_timeout: 600.0
-# RoboTwin conversion stores joint actions as next_qpos-current_qpos and
-# grippers as absolute 0/1 targets. This follows DreamZero's relative
-# joint-position action convention. The adapter integrates those deltas
-# into absolute qpos before calling TASK_ENV.take_action(..., action_type="qpos").
-action_mode: robotwin_delta
+# New DreamZero/RoboTwin checkpoints train with DreamZero relative-action
+# joint offsets and the server returns absolute qpos targets. Legacy
+# servers that do not advertise an action representation fall back to the
+# old RoboTwin delta integration path.
+action_mode: auto
 # Clamp arm targets to Franka's physical joint limits and grippers to [0, 1].
 clip_joint_targets: true
 # Replan every N action steps. Each call executes only the first N

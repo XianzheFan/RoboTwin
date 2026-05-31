@@ -17,12 +17,11 @@ sends the latest RoboTwin observation and receives a denormalized action
 chunk.
 
 Important RoboTwin-specific convention:
-``scripts/data/robotwin_to_lerobot_v2.py`` stores joint actions as
-``next_qpos - current_qpos`` for slots 0:7 and 8:15, while gripper slots
-7 and 15 stay absolute 0/1 commands. This matches DreamZero's default
-relative-joint action convention. The adapter therefore integrates the
-predicted joint deltas into absolute qpos targets before calling
-RoboTwin's ``take_action(..., action_type="qpos")``.
+RoboTwin's simulator consumes absolute qpos targets. New DreamZero
+RoboTwin checkpoints train with DreamZero's ``relative_action`` path, and
+the server converts denormalized joint offsets back to absolute qpos
+before returning them. Older checkpoints stored joint deltas directly;
+this adapter keeps a legacy delta mode for those runs.
 
 Wire protocol: see ``bimanual_policy_server.py`` docstring.
 """
@@ -164,7 +163,7 @@ class DreamZeroBimanualPolicy:
         ))
         self.replan_every = int(usr_args.get("replan_every", 8))
         self.connect_timeout = float(usr_args.get("connect_timeout", 600.0))
-        self.action_mode = str(usr_args.get("action_mode", "robotwin_delta"))
+        self.action_mode = str(usr_args.get("action_mode", "auto"))
         self.debug_interval = int(usr_args.get("debug_interval", 0))
         max_joint_delta = usr_args.get("max_joint_delta", None)
         self.max_joint_delta = None if max_joint_delta is None else float(max_joint_delta)
@@ -235,6 +234,21 @@ class DreamZeroBimanualPolicy:
         self._needs_reset = False
 
     # ---- action conversion --------------------------------------------
+    def _resolved_action_mode(self) -> str:
+        mode = self.action_mode.lower()
+        if mode != "auto":
+            return mode
+        meta_mode = ""
+        if self._server_meta is not None:
+            meta_mode = str(self._server_meta.get("action_representation", "")).lower()
+        if meta_mode in ("absolute_qpos", "absolute", "abs_qpos", "qpos"):
+            return "absolute"
+        if meta_mode in ("robotwin_delta", "delta", "joint_delta"):
+            return "robotwin_delta"
+        # Legacy servers did not advertise their representation. They
+        # paired with the old RoboTwin converter that emitted joint deltas.
+        return "robotwin_delta"
+
     def _clip_target_inplace(self, target: np.ndarray) -> None:
         target[7] = np.clip(target[7], 0.0, 1.0)
         target[15] = np.clip(target[15], 0.0, 1.0)
@@ -246,11 +260,11 @@ class DreamZeroBimanualPolicy:
     def _as_abs_action_chunk(self, action_chunk: np.ndarray, qpos: np.ndarray) -> list[np.ndarray]:
         """Convert server output to RoboTwin absolute-qpos targets.
 
-        ``robotwin_delta`` matches the LeRobot data written by
-        ``robotwin_to_lerobot_v2.py``: joint slots are deltas and gripper
-        slots are absolute commands. ``absolute`` remains as an explicit
-        diagnostic/fallback mode for checkpoints trained with raw absolute
-        targets.
+        ``auto`` trusts the server's advertised action representation.
+        New canonical DreamZero/RoboTwin checkpoints return absolute qpos
+        targets. ``robotwin_delta`` remains for legacy checkpoints whose
+        joint slots are per-step deltas and gripper slots are absolute
+        commands.
         """
         action_chunk = np.asarray(action_chunk, dtype=np.float32)
         qpos = np.asarray(qpos, dtype=np.float32).reshape(16)
@@ -261,7 +275,7 @@ class DreamZeroBimanualPolicy:
             )
 
         chunk = action_chunk[: self.replan_every]
-        mode = self.action_mode.lower()
+        mode = self._resolved_action_mode()
         if mode in ("absolute", "abs_qpos", "qpos"):
             targets = [a.astype(np.float32, copy=True) for a in chunk]
             for target in targets:
@@ -304,7 +318,7 @@ class DreamZeroBimanualPolicy:
         step_joints = np.concatenate([first_step[:7], first_step[8:15]])
         print(
             "[DreamZero/RoboTwin] "
-            f"infer={self._infer_count} mode={self.action_mode} "
+            f"infer={self._infer_count} mode={self.action_mode}->{self._resolved_action_mode()} "
             f"qpos0={np.array2string(qpos[:4], precision=3, suppress_small=True)} "
             f"raw0={np.array2string(raw_chunk[0, :4], precision=3, suppress_small=True)} "
             f"target0={np.array2string(targets[0][:4], precision=3, suppress_small=True)} "
