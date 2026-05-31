@@ -2,6 +2,7 @@ from __future__ import annotations
 import sys
 import os
 import subprocess
+import shutil
 
 sys.path.append("./")
 sys.path.append(f"./policy")
@@ -128,6 +129,10 @@ def main(usr_args):
 
     save_dir = Path(f"eval_result/{task_name}/{policy_name}/{task_config}/{ckpt_setting}/{current_time}")
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    if args["eval_video_log"] and shutil.which("ffmpeg") is None:
+        print("Warning: ffmpeg is not available; disabling eval video logging.")
+        args["eval_video_log"] = False
 
     if args["eval_video_log"]:
         video_save_dir = save_dir
