@@ -29,6 +29,7 @@ Wire protocol: see ``bimanual_policy_server.py`` docstring.
 from __future__ import annotations
 
 import os
+import csv
 import socket
 import time
 import uuid
@@ -54,6 +55,22 @@ def _as_bool(value, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _optional_float(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, str) and value.strip() == "":
+        return default
+    return float(value)
+
+
+def _optional_int(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, str) and value.strip() == "":
+        return default
+    return int(value)
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +183,29 @@ class DreamZeroBimanualPolicy:
         self.action_mode = str(usr_args.get("action_mode", "auto"))
         self.debug_interval = int(usr_args.get("debug_interval", 0))
         max_joint_delta = usr_args.get("max_joint_delta", None)
-        self.max_joint_delta = None if max_joint_delta is None else float(max_joint_delta)
+        self.max_joint_delta = _optional_float(max_joint_delta, None)
+        self.max_first_step_delta = _optional_float(
+            usr_args.get(
+                "max_first_step_delta",
+                os.environ.get("DREAMZERO_MAX_FIRST_STEP_DELTA"),
+            ),
+            None,
+        )
         self.clip_joint_targets = _as_bool(usr_args.get("clip_joint_targets", True), True)
+        self.action_trace_dir = str(
+            usr_args.get(
+                "action_trace_dir",
+                os.environ.get("DREAMZERO_ACTION_TRACE_DIR", ""),
+            )
+            or ""
+        )
+        self.action_trace_interval = _optional_int(
+            usr_args.get(
+                "action_trace_interval",
+                os.environ.get("DREAMZERO_ACTION_TRACE_INTERVAL"),
+            ),
+            1,
+        )
         self.fallback_instruction = usr_args.get(
             "fallback_instruction", "use the two robot arms to complete the task"
         )
@@ -182,6 +220,12 @@ class DreamZeroBimanualPolicy:
         self._last_qpos: np.ndarray | None = None
         self._needs_reset: bool = True
         self._infer_count: int = 0
+        self._trace_csv_path = None
+        if self.action_trace_dir:
+            os.makedirs(self.action_trace_dir, exist_ok=True)
+            self._trace_csv_path = os.path.join(
+                self.action_trace_dir, "action_trace_summary.csv"
+            )
 
     # ---- public hooks RoboTwin expects --------------------------------
     def set_instruction(self, text: str) -> None:
@@ -257,6 +301,25 @@ class DreamZeroBimanualPolicy:
         target[:7] = np.clip(target[:7], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
         target[8:15] = np.clip(target[8:15], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
 
+    def _clip_step_from_reference_inplace(
+        self,
+        target: np.ndarray,
+        reference: np.ndarray,
+    ) -> None:
+        if self.max_first_step_delta is None:
+            return
+        max_delta = float(self.max_first_step_delta)
+        target[:7] = np.clip(
+            target[:7],
+            reference[:7] - max_delta,
+            reference[:7] + max_delta,
+        )
+        target[8:15] = np.clip(
+            target[8:15],
+            reference[8:15] - max_delta,
+            reference[8:15] + max_delta,
+        )
+
     def _as_abs_action_chunk(self, action_chunk: np.ndarray, qpos: np.ndarray) -> list[np.ndarray]:
         """Convert server output to RoboTwin absolute-qpos targets.
 
@@ -277,9 +340,15 @@ class DreamZeroBimanualPolicy:
         chunk = action_chunk[: self.replan_every]
         mode = self._resolved_action_mode()
         if mode in ("absolute", "abs_qpos", "qpos"):
-            targets = [a.astype(np.float32, copy=True) for a in chunk]
-            for target in targets:
+            targets = []
+            cur = qpos.copy()
+            for action in chunk:
+                target = action.astype(np.float32, copy=True)
                 self._clip_target_inplace(target)
+                self._clip_step_from_reference_inplace(target, cur)
+                self._clip_target_inplace(target)
+                targets.append(target.astype(np.float32, copy=True))
+                cur = target
             return targets
 
         if mode not in ("robotwin_delta", "delta", "joint_delta"):
@@ -302,9 +371,110 @@ class DreamZeroBimanualPolicy:
             target[8:15] = cur[8:15] + delta[8:15]
             target[15] = np.clip(delta[15], 0.0, 1.0)
             self._clip_target_inplace(target)
+            self._clip_step_from_reference_inplace(target, cur)
+            self._clip_target_inplace(target)
             targets.append(target.astype(np.float32, copy=True))
             cur = target
         return targets
+
+    def _write_action_trace(
+        self,
+        qpos: np.ndarray,
+        reply: dict,
+        server_chunk: np.ndarray,
+        targets: list[np.ndarray],
+    ) -> None:
+        if not self.action_trace_dir or not targets:
+            return
+        if self.action_trace_interval <= 0:
+            return
+        if self._infer_count % self.action_trace_interval != 0:
+            return
+
+        n = min(self.replan_every, server_chunk.shape[0], len(targets))
+        server_actions = server_chunk[:n].astype(np.float32, copy=True)
+        client_targets = np.stack(targets[:n]).astype(np.float32, copy=True)
+        qpos_anchor = qpos.astype(np.float32, copy=True)
+
+        server_delta = server_actions.copy()
+        server_delta[:, :7] -= qpos_anchor[:7]
+        server_delta[:, 8:15] -= qpos_anchor[8:15]
+        server_delta[:, 7] = server_actions[:, 7]
+        server_delta[:, 15] = server_actions[:, 15]
+
+        client_step_delta = client_targets.copy()
+        client_step_delta[0, :7] -= qpos_anchor[:7]
+        client_step_delta[0, 8:15] -= qpos_anchor[8:15]
+        if n > 1:
+            client_step_delta[1:, :7] -= client_targets[:-1, :7]
+            client_step_delta[1:, 8:15] -= client_targets[:-1, 8:15]
+        client_step_delta[:, 7] = client_targets[:, 7]
+        client_step_delta[:, 15] = client_targets[:, 15]
+
+        norm_raw = reply.get("action_norm_raw")
+        norm_clipped = reply.get("action_norm_clipped")
+        norm_raw_arr = (
+            np.asarray(norm_raw, dtype=np.float32)
+            if norm_raw is not None
+            else np.empty((0, 16), dtype=np.float32)
+        )
+        norm_clipped_arr = (
+            np.asarray(norm_clipped, dtype=np.float32)
+            if norm_clipped is not None
+            else np.empty((0, 16), dtype=np.float32)
+        )
+
+        prefix = f"session_{self.session_id[:12]}_infer_{self._infer_count:06d}"
+        npz_path = os.path.join(self.action_trace_dir, f"{prefix}.npz")
+        np.savez_compressed(
+            npz_path,
+            qpos_anchor=qpos_anchor,
+            action_norm_raw=norm_raw_arr,
+            action_norm_clipped=norm_clipped_arr,
+            server_action_chunk=server_actions,
+            server_delta_from_anchor=server_delta,
+            client_targets=client_targets,
+            client_step_delta=client_step_delta,
+        )
+
+        def _minmax(arr: np.ndarray) -> tuple[float, float]:
+            if arr.size == 0:
+                return float("nan"), float("nan")
+            joints = np.concatenate([arr[..., :7].reshape(-1), arr[..., 8:15].reshape(-1)])
+            return float(np.min(joints)), float(np.max(joints))
+
+        row = {
+            "session_id": self.session_id,
+            "infer": self._infer_count,
+            "mode": f"{self.action_mode}->{self._resolved_action_mode()}",
+            "server_action_representation": (
+                "" if self._server_meta is None else self._server_meta.get("action_representation", "")
+            ),
+            "replan_every": self.replan_every,
+            "max_first_step_delta": (
+                "" if self.max_first_step_delta is None else self.max_first_step_delta
+            ),
+            "npz": npz_path,
+        }
+        for name, arr in [
+            ("norm_raw", norm_raw_arr),
+            ("norm_clipped", norm_clipped_arr),
+            ("server_delta", server_delta),
+            ("server_action", server_actions),
+            ("client_step_delta", client_step_delta),
+            ("client_target", client_targets),
+        ]:
+            lo, hi = _minmax(arr)
+            row[f"{name}_joint_min"] = lo
+            row[f"{name}_joint_max"] = hi
+
+        assert self._trace_csv_path is not None
+        write_header = not os.path.exists(self._trace_csv_path)
+        with open(self._trace_csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
 
     def _debug_action(self, qpos: np.ndarray, raw_chunk: np.ndarray, targets: list[np.ndarray]) -> None:
         if self.debug_interval <= 0 or self._infer_count % self.debug_interval != 0:
@@ -350,6 +520,7 @@ class DreamZeroBimanualPolicy:
         flat_action = np.asarray(reply["action_chunk"], dtype=np.float32)
         self._infer_count += 1
         targets = self._as_abs_action_chunk(flat_action, qpos)
+        self._write_action_trace(qpos, reply, flat_action, targets)
         self._debug_action(qpos, flat_action, targets)
         return targets
 

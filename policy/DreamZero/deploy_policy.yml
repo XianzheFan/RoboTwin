@@ -17,9 +17,18 @@ connect_timeout: 600.0
 action_mode: auto
 # Clamp arm targets to Franka's physical joint limits and grippers to [0, 1].
 clip_joint_targets: true
+# Optional safety guard for eval diagnostics. When set, each dispatched qpos
+# target is clipped to this max joint-space step from the previously dispatched
+# target/current qpos. Leave empty to preserve raw server targets.
+max_first_step_delta:
 # Replan every N action steps. Each call executes only the first N
 # targets from the model chunk and discards the rest.
 replan_every: 8
 # Print one compact action diagnostic every N server calls (0 disables).
 debug_interval: 10
+# Optional directory for per-inference .npz traces plus action_trace_summary.csv.
+# Use with the DreamZero server's --return-action-debug flag to include
+# normalized action predictions in the trace files.
+action_trace_dir: ""
+action_trace_interval: 1
 fallback_instruction: "use the two robot arms to complete the task"

@@ -17,6 +17,18 @@ gpu_id=${5}
 DREAMZERO_HOST=${DREAMZERO_HOST:-127.0.0.1}
 DREAMZERO_PORT=${DREAMZERO_PORT:-5001}
 TEST_NUM=${TEST_NUM:-100}
+MAX_FIRST_STEP_DELTA=${MAX_FIRST_STEP_DELTA:-}
+ACTION_TRACE_DIR=${ACTION_TRACE_DIR:-}
+ACTION_TRACE_INTERVAL=${ACTION_TRACE_INTERVAL:-1}
+
+extra_args=()
+if [[ -n "${MAX_FIRST_STEP_DELTA}" ]]; then
+    extra_args+=(--max_first_step_delta "${MAX_FIRST_STEP_DELTA}")
+fi
+if [[ -n "${ACTION_TRACE_DIR}" ]]; then
+    extra_args+=(--action_trace_dir "${ACTION_TRACE_DIR}")
+    extra_args+=(--action_trace_interval "${ACTION_TRACE_INTERVAL}")
+fi
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
@@ -36,6 +48,7 @@ python -u script/eval_policy.py --config policy/${policy_name}/deploy_policy.yml
     --server_host ${DREAMZERO_HOST} \
     --server_port ${DREAMZERO_PORT} \
     --test_num ${TEST_NUM} \
+    "${extra_args[@]}" \
     --need_plan False \
     --expert_check False \
     --instruction_type unseen
