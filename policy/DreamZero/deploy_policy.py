@@ -19,8 +19,9 @@ chunk.
 Important RoboTwin-specific convention:
 ``scripts/data/robotwin_to_lerobot_v2.py`` stores joint actions as
 ``next_qpos - current_qpos`` for slots 0:7 and 8:15, while gripper slots
-7 and 15 stay absolute 0/1 commands. This adapter therefore integrates
-the predicted joint deltas into absolute qpos targets before calling
+7 and 15 stay absolute 0/1 commands. This matches DreamZero's default
+relative-joint action convention. The adapter therefore integrates the
+predicted joint deltas into absolute qpos targets before calling
 RoboTwin's ``take_action(..., action_type="qpos")``.
 
 Wire protocol: see ``bimanual_policy_server.py`` docstring.
@@ -34,6 +35,26 @@ import time
 import uuid
 
 import numpy as np
+
+
+FRANKA_ARM_LOWER = np.asarray(
+    [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
+    dtype=np.float32,
+)
+FRANKA_ARM_UPPER = np.asarray(
+    [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
+    dtype=np.float32,
+)
+
+
+def _as_bool(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +168,7 @@ class DreamZeroBimanualPolicy:
         self.debug_interval = int(usr_args.get("debug_interval", 0))
         max_joint_delta = usr_args.get("max_joint_delta", None)
         self.max_joint_delta = None if max_joint_delta is None else float(max_joint_delta)
+        self.clip_joint_targets = _as_bool(usr_args.get("clip_joint_targets", True), True)
         self.fallback_instruction = usr_args.get(
             "fallback_instruction", "use the two robot arms to complete the task"
         )
@@ -213,14 +235,22 @@ class DreamZeroBimanualPolicy:
         self._needs_reset = False
 
     # ---- action conversion --------------------------------------------
+    def _clip_target_inplace(self, target: np.ndarray) -> None:
+        target[7] = np.clip(target[7], 0.0, 1.0)
+        target[15] = np.clip(target[15], 0.0, 1.0)
+        if not self.clip_joint_targets:
+            return
+        target[:7] = np.clip(target[:7], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
+        target[8:15] = np.clip(target[8:15], FRANKA_ARM_LOWER, FRANKA_ARM_UPPER)
+
     def _as_abs_action_chunk(self, action_chunk: np.ndarray, qpos: np.ndarray) -> list[np.ndarray]:
         """Convert server output to RoboTwin absolute-qpos targets.
 
         ``robotwin_delta`` matches the LeRobot data written by
         ``robotwin_to_lerobot_v2.py``: joint slots are deltas and gripper
-        slots are absolute commands. ``absolute`` is kept as an explicit
-        fallback for diagnostics or future checkpoints trained with raw
-        absolute targets.
+        slots are absolute commands. ``absolute`` remains as an explicit
+        diagnostic/fallback mode for checkpoints trained with raw absolute
+        targets.
         """
         action_chunk = np.asarray(action_chunk, dtype=np.float32)
         qpos = np.asarray(qpos, dtype=np.float32).reshape(16)
@@ -235,8 +265,7 @@ class DreamZeroBimanualPolicy:
         if mode in ("absolute", "abs_qpos", "qpos"):
             targets = [a.astype(np.float32, copy=True) for a in chunk]
             for target in targets:
-                target[7] = np.clip(target[7], 0.0, 1.0)
-                target[15] = np.clip(target[15], 0.0, 1.0)
+                self._clip_target_inplace(target)
             return targets
 
         if mode not in ("robotwin_delta", "delta", "joint_delta"):
@@ -258,6 +287,7 @@ class DreamZeroBimanualPolicy:
             target[7] = np.clip(delta[7], 0.0, 1.0)
             target[8:15] = cur[8:15] + delta[8:15]
             target[15] = np.clip(delta[15], 0.0, 1.0)
+            self._clip_target_inplace(target)
             targets.append(target.astype(np.float32, copy=True))
             cur = target
         return targets
@@ -268,15 +298,20 @@ class DreamZeroBimanualPolicy:
         if not targets:
             return
         n = min(self.replan_every, raw_chunk.shape[0])
-        joint_delta = np.concatenate([raw_chunk[:n, :7], raw_chunk[:n, 8:15]], axis=1)
+        first_step = targets[0] - qpos
+        raw_joints = np.concatenate([raw_chunk[:n, :7], raw_chunk[:n, 8:15]], axis=1)
+        target_joints = np.concatenate([targets[0][:7], targets[0][8:15]])
+        step_joints = np.concatenate([first_step[:7], first_step[8:15]])
         print(
             "[DreamZero/RoboTwin] "
             f"infer={self._infer_count} mode={self.action_mode} "
             f"qpos0={np.array2string(qpos[:4], precision=3, suppress_small=True)} "
-            f"delta0={np.array2string(raw_chunk[0, :4], precision=3, suppress_small=True)} "
+            f"raw0={np.array2string(raw_chunk[0, :4], precision=3, suppress_small=True)} "
             f"target0={np.array2string(targets[0][:4], precision=3, suppress_small=True)} "
             f"grip=({targets[0][7]:.3f},{targets[0][15]:.3f}) "
-            f"delta_minmax=({joint_delta.min():.4f},{joint_delta.max():.4f})",
+            f"raw_joint_minmax=({raw_joints.min():.4f},{raw_joints.max():.4f}) "
+            f"step_joint_minmax=({step_joints.min():.4f},{step_joints.max():.4f}) "
+            f"target_joint_minmax=({target_joints.min():.4f},{target_joints.max():.4f})",
             flush=True,
         )
 
