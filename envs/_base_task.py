@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import re
 import sapien.core as sapien
@@ -387,10 +388,10 @@ class Base_Task(gym.Env):
         """
         if not hasattr(self, "robot"):
             self.robot = Robot(self.scene, self.need_topp, **kwags)
-            self.robot.set_planner(self.scene)
+            self.robot.set_planner(self.scene, enable_curobo=self.need_plan)
             self.robot.init_joints()
         else:
-            self.robot.reset(self.scene, self.need_topp, **kwags)
+            self.robot.reset(self.scene, self.need_topp, enable_curobo=self.need_plan, **kwags)
 
         for link in self.robot.left_entity.get_links():
             link: sapien.physx.PhysxArticulationLinkComponent = link

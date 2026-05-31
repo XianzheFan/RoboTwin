@@ -1,3 +1,4 @@
+from __future__ import annotations
 import sys
 import os
 import subprocess
@@ -78,6 +79,10 @@ def main(usr_args):
     with open(f"./task_config/{task_config}.yml", "r", encoding="utf-8") as f:
         args = yaml.load(f.read(), Loader=yaml.FullLoader)
 
+    for override_key in ("need_plan", "expert_check"):
+        if override_key in usr_args:
+            args[override_key] = usr_args[override_key]
+
     args['task_name'] = task_name
     args["task_config"] = task_config
     args["ckpt_setting"] = ckpt_setting
@@ -148,6 +153,8 @@ def main(usr_args):
     print("\033[94mWrist Camera Config:\033[0m " + str(args["camera"]["wrist_camera_type"]) + f", " +
           str(args["camera"]["collect_wrist_camera"]))
     print("\033[94mEmbodiment Config:\033[0m " + embodiment_name)
+    print("\033[94mNeed Plan:\033[0m " + str(args.get("need_plan", True)))
+    print("\033[94mExpert Check:\033[0m " + str(args.get("expert_check", True)))
     print("\n==================================")
 
     TASK_ENV = class_decorator(args["task_name"])
@@ -197,7 +204,7 @@ def eval_policy(task_name,
     print(f"\033[34mTask Name: {args['task_name']}\033[0m")
     print(f"\033[34mPolicy Name: {args['policy_name']}\033[0m")
 
-    expert_check = True
+    expert_check = args.get("expert_check", True)
     TASK_ENV.suc = 0
     TASK_ENV.test_num = 0
 
@@ -233,14 +240,20 @@ def eval_policy(task_name,
                 args["render_freq"] = render_freq
                 continue
             except Exception as e:
-                # stack_trace = traceback.format_exc()
-                # print(" -------------")
-                # print("Error: ", e)
-                # print(" -------------")
-                TASK_ENV.close_env()
+                print(" -------------")
+                print(f"Error on seed {now_seed}:", repr(e))
+                print(traceback.format_exc())
+                print(" -------------")
+                fatal_cuda = "CUDA error" in repr(e)
+                try:
+                    TASK_ENV.close_env()
+                except Exception:
+                    if not fatal_cuda:
+                        raise
+                if fatal_cuda:
+                    raise
                 now_seed += 1
                 args["render_freq"] = render_freq
-                print("error occurs !")
                 continue
 
         if (not expert_check) or (TASK_ENV.plan_success and TASK_ENV.check_success()):
@@ -254,9 +267,22 @@ def eval_policy(task_name,
         args["render_freq"] = render_freq
 
         TASK_ENV.setup_demo(now_ep_num=now_id, seed=now_seed, is_test=True, **args)
-        episode_info_list = [episode_info["info"]]
+        if expert_check:
+            episode_info_list = [episode_info["info"]]
+        elif task_name == "beat_block_hammer" and hasattr(TASK_ENV, "block"):
+            block_pose = TASK_ENV.block.get_functional_point(0, "pose").p
+            episode_info_list = [{
+                "{A}": "020_hammer/base0",
+                "{a}": "left" if block_pose[0] < 0 else "right",
+            }]
+        else:
+            episode_info_list = [TASK_ENV.info.get("info", {})]
         results = generate_episode_descriptions(args["task_name"], episode_info_list, test_num)
-        instruction = np.random.choice(results[0][instruction_type])
+        instruction = (
+            np.random.choice(results[0][instruction_type])
+            if results and results[0].get(instruction_type)
+            else "use the robot arm to pick up the hammer and hit the block"
+        )
         TASK_ENV.set_instruction(instruction=instruction)  # set language instruction
 
         if TASK_ENV.eval_video_path is not None:

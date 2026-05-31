@@ -1,0 +1,15 @@
+# DreamZero multi-agent (bimanual) policy adapter for RoboTwin.
+#
+# This is a thin WebSocket client. The heavy lifting (VLA forward,
+# normalization, rolling history) lives in the bimanual server:
+#   dreamzero/eval_utils/bimanual_policy_server.py
+#
+# Override server_host / server_port via env vars DREAMZERO_HOST,
+# DREAMZERO_PORT in eval.sh, or via --overrides on the CLI.
+server_host: 127.0.0.1
+server_port: 5001
+# How long to wait for the server to come up (model load can be slow).
+connect_timeout: 600.0
+# Replan every N action steps (1 = closed-loop, 24 = pure open-loop).
+replan_every: 8
+fallback_instruction: "use the two robot arms to complete the task"

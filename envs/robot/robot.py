@@ -1,3 +1,4 @@
+from __future__ import annotations
 import sapien.core as sapien
 import numpy as np
 import pdb
@@ -121,19 +122,22 @@ class Robot:
         self.left_entity.set_root_pose(self.left_entity_origion_pose)
         self.right_entity.set_root_pose(self.right_entity_origion_pose)
 
-    def reset(self, scene, need_topp=False, **kwargs):
+    def reset(self, scene, need_topp=False, enable_curobo=True, **kwargs):
         self._init_robot_(scene, need_topp, **kwargs)
 
-        if self.communication_flag:
-            if hasattr(self, "left_conn") and self.left_conn:
-                self.left_conn.send({"cmd": "reset"})
-                _ = self.left_conn.recv()
-            if hasattr(self, "right_conn") and self.right_conn:
-                self.right_conn.send({"cmd": "reset"})
-                _ = self.right_conn.recv()
+        if not enable_curobo:
+            self.set_planner(scene=scene, enable_curobo=False)
         else:
-            if not isinstance(self.left_planner, CuroboPlanner) or not isinstance(self.right_planner, CuroboPlanner):
-                self.set_planner(scene=scene)
+            if self.communication_flag:
+                if hasattr(self, "left_conn") and self.left_conn:
+                    self.left_conn.send({"cmd": "reset"})
+                    _ = self.left_conn.recv()
+                if hasattr(self, "right_conn") and self.right_conn:
+                    self.right_conn.send({"cmd": "reset"})
+                    _ = self.right_conn.recv()
+            else:
+                if not isinstance(self.left_planner, CuroboPlanner) or not isinstance(self.right_planner, CuroboPlanner):
+                    self.set_planner(scene=scene)
 
         self.init_joints()
 
@@ -254,51 +258,55 @@ class Robot:
         print("left ee: ", self.left_ee.get_name())
         print("right ee: ", self.right_ee.get_name())
 
-    def set_planner(self, scene=None):
+    def set_planner(self, scene=None, enable_curobo=True):
         abs_left_curobo_yml_path = os.path.join(CONFIGS.ROOT_PATH, self.left_curobo_yml_path)
         abs_right_curobo_yml_path = os.path.join(CONFIGS.ROOT_PATH, self.right_curobo_yml_path)
 
-        self.communication_flag = (abs_left_curobo_yml_path != abs_right_curobo_yml_path)
+        self.communication_flag = enable_curobo and (abs_left_curobo_yml_path != abs_right_curobo_yml_path)
 
         if self.is_dual_arm:
             abs_left_curobo_yml_path = abs_left_curobo_yml_path.replace("curobo.yml", "curobo_left.yml")
             abs_right_curobo_yml_path = abs_right_curobo_yml_path.replace("curobo.yml", "curobo_right.yml")
 
-        if not self.communication_flag:
-            self.left_planner = CuroboPlanner(self.left_entity_origion_pose,
-                                              self.left_arm_joints_name,
-                                              [joint.get_name() for joint in self.left_entity.get_active_joints()],
-                                              yml_path=abs_left_curobo_yml_path)
-            self.right_planner = CuroboPlanner(self.right_entity_origion_pose,
-                                               self.right_arm_joints_name,
-                                               [joint.get_name() for joint in self.right_entity.get_active_joints()],
-                                               yml_path=abs_right_curobo_yml_path)
+        if enable_curobo:
+            if not self.communication_flag:
+                self.left_planner = CuroboPlanner(self.left_entity_origion_pose,
+                                                  self.left_arm_joints_name,
+                                                  [joint.get_name() for joint in self.left_entity.get_active_joints()],
+                                                  yml_path=abs_left_curobo_yml_path)
+                self.right_planner = CuroboPlanner(self.right_entity_origion_pose,
+                                                   self.right_arm_joints_name,
+                                                   [joint.get_name() for joint in self.right_entity.get_active_joints()],
+                                                   yml_path=abs_right_curobo_yml_path)
+            else:
+                self.left_conn, left_child_conn = mp.Pipe()
+                self.right_conn, right_child_conn = mp.Pipe()
+
+                left_args = {
+                    "origin_pose": self.left_entity_origion_pose,
+                    "joints_name": self.left_arm_joints_name,
+                    "all_joints": [joint.get_name() for joint in self.left_entity.get_active_joints()],
+                    "yml_path": abs_left_curobo_yml_path
+                }
+
+                right_args = {
+                    "origin_pose": self.right_entity_origion_pose,
+                    "joints_name": self.right_arm_joints_name,
+                    "all_joints": [joint.get_name() for joint in self.right_entity.get_active_joints()],
+                    "yml_path": abs_right_curobo_yml_path
+                }
+
+                self.left_proc = mp.Process(target=planner_process_worker, args=(left_child_conn, left_args))
+                self.right_proc = mp.Process(target=planner_process_worker, args=(right_child_conn, right_args))
+
+                self.left_proc.daemon = True
+                self.right_proc.daemon = True
+
+                self.left_proc.start()
+                self.right_proc.start()
         else:
-            self.left_conn, left_child_conn = mp.Pipe()
-            self.right_conn, right_child_conn = mp.Pipe()
-
-            left_args = {
-                "origin_pose": self.left_entity_origion_pose,
-                "joints_name": self.left_arm_joints_name,
-                "all_joints": [joint.get_name() for joint in self.left_entity.get_active_joints()],
-                "yml_path": abs_left_curobo_yml_path
-            }
-
-            right_args = {
-                "origin_pose": self.right_entity_origion_pose,
-                "joints_name": self.right_arm_joints_name,
-                "all_joints": [joint.get_name() for joint in self.right_entity.get_active_joints()],
-                "yml_path": abs_right_curobo_yml_path
-            }
-
-            self.left_proc = mp.Process(target=planner_process_worker, args=(left_child_conn, left_args))
-            self.right_proc = mp.Process(target=planner_process_worker, args=(right_child_conn, right_args))
-
-            self.left_proc.daemon = True
-            self.right_proc.daemon = True
-
-            self.left_proc.start()
-            self.right_proc.start()
+            self.left_planner = None
+            self.right_planner = None
 
         if self.need_topp:
             self.left_mplib_planner = MplibPlanner(
@@ -327,6 +335,15 @@ class Robot:
         except:
             print("Update world pointcloud wrong!")
 
+    def _plan_gripper_direct(self, now_val, target_val):
+        num_step = 200
+        per_step = (target_val - now_val) / num_step
+        return {
+            "num_step": num_step,
+            "per_step": per_step,
+            "result": np.linspace(now_val, target_val, num_step),
+        }
+
     def _trans_from_gripper_to_endlink(self, target_pose, arm_tag=None):
         gripper_bias = (self.left_gripper_bias if arm_tag == "left" else self.right_gripper_bias)
         inv_delta_matrix = (self.left_inv_delta_matrix if arm_tag == "left" else self.right_inv_delta_matrix)
@@ -342,6 +359,8 @@ class Robot:
         if self.communication_flag:
             self.left_conn.send({"cmd": "plan_grippers", "now_val": now_val, "target_val": target_val})
             return self.left_conn.recv()
+        elif self.left_planner is None:
+            return self._plan_gripper_direct(now_val, target_val)
         else:
             return self.left_planner.plan_grippers(now_val, target_val)
 
@@ -349,6 +368,8 @@ class Robot:
         if self.communication_flag:
             self.right_conn.send({"cmd": "plan_grippers", "now_val": now_val, "target_val": target_val})
             return self.right_conn.recv()
+        elif self.right_planner is None:
+            return self._plan_gripper_direct(now_val, target_val)
         else:
             return self.right_planner.plan_grippers(now_val, target_val)
 
