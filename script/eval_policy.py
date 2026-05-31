@@ -171,8 +171,8 @@ def main(usr_args):
 
     st_seed = 100000 * (1 + seed)
     suc_nums = []
-    test_num = 100
-    topk = 1
+    test_num = int(usr_args.get("test_num", args.get("test_num", 100)))
+    topk = int(usr_args.get("topk", 1))
 
     model = get_model(usr_args)
     st_seed, suc_num = eval_policy(task_name,

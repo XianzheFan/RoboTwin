@@ -16,6 +16,7 @@ gpu_id=${5}
 
 DREAMZERO_HOST=${DREAMZERO_HOST:-127.0.0.1}
 DREAMZERO_PORT=${DREAMZERO_PORT:-5001}
+TEST_NUM=${TEST_NUM:-100}
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id (to use): ${gpu_id}\033[0m"
@@ -34,6 +35,7 @@ python -u script/eval_policy.py --config policy/${policy_name}/deploy_policy.yml
     --policy_name ${policy_name} \
     --server_host ${DREAMZERO_HOST} \
     --server_port ${DREAMZERO_PORT} \
+    --test_num ${TEST_NUM} \
     --need_plan False \
     --expert_check False \
     --instruction_type unseen
