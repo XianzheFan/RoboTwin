@@ -10,6 +10,13 @@ server_host: 127.0.0.1
 server_port: 5001
 # How long to wait for the server to come up (model load can be slow).
 connect_timeout: 600.0
-# Replan every N action steps (1 = closed-loop, 24 = pure open-loop).
+# RoboTwin conversion stores joint actions as next_qpos-current_qpos and
+# grippers as absolute 0/1 targets. The adapter integrates those deltas
+# into absolute qpos before calling TASK_ENV.take_action(..., action_type="qpos").
+action_mode: robotwin_delta
+# Replan every N action steps. Each call executes only the first N
+# targets from the model chunk and discards the rest.
 replan_every: 8
+# Print one compact action diagnostic every N server calls (0 disables).
+debug_interval: 10
 fallback_instruction: "use the two robot arms to complete the task"

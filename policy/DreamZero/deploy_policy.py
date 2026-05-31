@@ -12,9 +12,16 @@ torch 2.8). All heavy lifting happens in a separate process:
   +-----------------+                      +-----------------------+
 
 The server (``dreamzero/eval_utils/bimanual_policy_server.py``) holds the
-rolling 33-frame history and the inverse-q99 normalization, so this
-client just sends per-step obs and applies the returned absolute-qpos
-actions.
+rolling 33-frame history and the inverse-q99 normalization, so this client
+sends the latest RoboTwin observation and receives a denormalized action
+chunk.
+
+Important RoboTwin-specific convention:
+``scripts/data/robotwin_to_lerobot_v2.py`` stores joint actions as
+``next_qpos - current_qpos`` for slots 0:7 and 8:15, while gripper slots
+7 and 15 stay absolute 0/1 commands. This adapter therefore integrates
+the predicted joint deltas into absolute qpos targets before calling
+RoboTwin's ``take_action(..., action_type="qpos")``.
 
 Wire protocol: see ``bimanual_policy_server.py`` docstring.
 """
@@ -27,7 +34,6 @@ import time
 import uuid
 
 import numpy as np
-import yaml
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +143,10 @@ class DreamZeroBimanualPolicy:
         ))
         self.replan_every = int(usr_args.get("replan_every", 8))
         self.connect_timeout = float(usr_args.get("connect_timeout", 600.0))
+        self.action_mode = str(usr_args.get("action_mode", "robotwin_delta"))
+        self.debug_interval = int(usr_args.get("debug_interval", 0))
+        max_joint_delta = usr_args.get("max_joint_delta", None)
+        self.max_joint_delta = None if max_joint_delta is None else float(max_joint_delta)
         self.fallback_instruction = usr_args.get(
             "fallback_instruction", "use the two robot arms to complete the task"
         )
@@ -145,12 +155,12 @@ class DreamZeroBimanualPolicy:
         # video history scoped to one rollout.
         self.session_id: str = uuid.uuid4().hex
         self.obs_cache = []  # only stores latest for RoboTwin's empty-check
-        self._pending_actions: list[np.ndarray] = []
         self._ws = None
         self._server_meta: dict | None = None
         self._instruction: str = self.fallback_instruction
         self._last_qpos: np.ndarray | None = None
         self._needs_reset: bool = True
+        self._infer_count: int = 0
 
     # ---- public hooks RoboTwin expects --------------------------------
     def set_instruction(self, text: str) -> None:
@@ -163,13 +173,13 @@ class DreamZeroBimanualPolicy:
 
     def reset(self) -> None:
         self.obs_cache = []
-        self._pending_actions.clear()
         self._last_qpos = None
         self._instruction = self.fallback_instruction
         # New episode -> new session id, then ask the server to clear
         # its history for that session.
         self.session_id = uuid.uuid4().hex
         self._needs_reset = True
+        self._infer_count = 0
 
     # ---- connection management ----------------------------------------
     def _ensure_connected(self):
@@ -202,43 +212,97 @@ class DreamZeroBimanualPolicy:
         })
         self._needs_reset = False
 
+    # ---- action conversion --------------------------------------------
+    def _as_abs_action_chunk(self, action_chunk: np.ndarray, qpos: np.ndarray) -> list[np.ndarray]:
+        """Convert server output to RoboTwin absolute-qpos targets.
+
+        ``robotwin_delta`` matches the LeRobot data written by
+        ``robotwin_to_lerobot_v2.py``: joint slots are deltas and gripper
+        slots are absolute commands. ``absolute`` is kept as an explicit
+        fallback for diagnostics or future checkpoints trained with raw
+        absolute targets.
+        """
+        action_chunk = np.asarray(action_chunk, dtype=np.float32)
+        qpos = np.asarray(qpos, dtype=np.float32).reshape(16)
+        if action_chunk.ndim != 2 or action_chunk.shape[1] != 16:
+            raise RuntimeError(
+                f"Unexpected action_chunk shape {action_chunk.shape}; "
+                "want [T_a, 16]"
+            )
+
+        chunk = action_chunk[: self.replan_every]
+        mode = self.action_mode.lower()
+        if mode in ("absolute", "abs_qpos", "qpos"):
+            targets = [a.astype(np.float32, copy=True) for a in chunk]
+            for target in targets:
+                target[7] = np.clip(target[7], 0.0, 1.0)
+                target[15] = np.clip(target[15], 0.0, 1.0)
+            return targets
+
+        if mode not in ("robotwin_delta", "delta", "joint_delta"):
+            raise ValueError(
+                f"Unsupported action_mode={self.action_mode!r}; "
+                "expected robotwin_delta or absolute"
+            )
+
+        targets: list[np.ndarray] = []
+        cur = qpos.copy()
+        for delta in chunk:
+            delta = delta.astype(np.float32, copy=True)
+            if self.max_joint_delta is not None:
+                delta[:7] = np.clip(delta[:7], -self.max_joint_delta, self.max_joint_delta)
+                delta[8:15] = np.clip(delta[8:15], -self.max_joint_delta, self.max_joint_delta)
+
+            target = cur.copy()
+            target[:7] = cur[:7] + delta[:7]
+            target[7] = np.clip(delta[7], 0.0, 1.0)
+            target[8:15] = cur[8:15] + delta[8:15]
+            target[15] = np.clip(delta[15], 0.0, 1.0)
+            targets.append(target.astype(np.float32, copy=True))
+            cur = target
+        return targets
+
+    def _debug_action(self, qpos: np.ndarray, raw_chunk: np.ndarray, targets: list[np.ndarray]) -> None:
+        if self.debug_interval <= 0 or self._infer_count % self.debug_interval != 0:
+            return
+        if not targets:
+            return
+        n = min(self.replan_every, raw_chunk.shape[0])
+        joint_delta = np.concatenate([raw_chunk[:n, :7], raw_chunk[:n, 8:15]], axis=1)
+        print(
+            "[DreamZero/RoboTwin] "
+            f"infer={self._infer_count} mode={self.action_mode} "
+            f"qpos0={np.array2string(qpos[:4], precision=3, suppress_small=True)} "
+            f"delta0={np.array2string(raw_chunk[0, :4], precision=3, suppress_small=True)} "
+            f"target0={np.array2string(targets[0][:4], precision=3, suppress_small=True)} "
+            f"grip=({targets[0][7]:.3f},{targets[0][15]:.3f}) "
+            f"delta_minmax=({joint_delta.min():.4f},{joint_delta.max():.4f})",
+            flush=True,
+        )
+
     # ---- main action chunk request ------------------------------------
     def get_action(self) -> list[np.ndarray]:
-        if self._pending_actions:
-            actions, self._pending_actions = self._pending_actions, []
-            return actions
         if not self.obs_cache:
             raise RuntimeError("No observation cached; call update_obs() first")
 
         self._reset_server_if_needed()
 
         obs = self.obs_cache[-1]
+        qpos = obs["qpos"].astype(np.float32)
         reply = self._send({
             "endpoint": "infer",
             "session_id": self.session_id,
-            "qpos": obs["qpos"].astype(np.float32),
+            "qpos": qpos,
             "head_rgb": obs["head_rgb"],
             "left_rgb": obs["left_rgb"],
             "right_rgb": obs["right_rgb"],
             "prompt": self._instruction,
         })
         flat_action = np.asarray(reply["action_chunk"], dtype=np.float32)
-        if flat_action.ndim != 2 or flat_action.shape[1] != 16:
-            raise RuntimeError(
-                f"Unexpected action_chunk shape {flat_action.shape}; "
-                "want [T_a, 16]"
-            )
-
-        # The RoboTwin/DreamZero training config uses relative_action=false,
-        # so the server inverse-normalizes directly into absolute qpos
-        # targets. Feed those targets through unchanged to action_type='qpos'.
-        absolute_actions = [
-            action.astype(np.float32, copy=True) for action in flat_action
-        ]
-
-        to_run = absolute_actions[: self.replan_every]
-        self._pending_actions = absolute_actions[self.replan_every :]
-        return to_run
+        self._infer_count += 1
+        targets = self._as_abs_action_chunk(flat_action, qpos)
+        self._debug_action(qpos, flat_action, targets)
+        return targets
 
 
 def get_model(usr_args):
