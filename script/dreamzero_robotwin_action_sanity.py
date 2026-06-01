@@ -23,6 +23,7 @@ ARM_SLICES = {
     "panda0_joint_pos": slice(0, 7),
     "panda1_joint_pos": slice(8, 15),
 }
+GRIPPER_INDICES = np.array([7, 15])
 
 
 def _round_list(values: np.ndarray, ndigits: int = 5) -> list[float]:
@@ -109,6 +110,54 @@ def _compute_offsets(
         {key: chunk_arr[:, slc] for key, slc in ARM_SLICES.items()},
         lengths,
     )
+
+
+def _compute_gripper_filter_diagnostics(
+    episode_paths: Iterable[Path],
+    step_filter: dict[int, set[int]],
+    gripper_threshold: float,
+) -> dict:
+    total_rows = 0
+    gripper_motion_rows = 0
+    filtered_rows = 0
+    filtered_gripper_motion_rows = 0
+    kept_gripper_motion_rows = 0
+    max_filtered_gripper_motion = 0.0
+
+    for converted_ep_idx, path in enumerate(episode_paths):
+        qpos = _load_hdf5_qpos(path)
+        if len(qpos) < 2:
+            continue
+        gripper_delta = qpos[1:, GRIPPER_INDICES] - qpos[:-1, GRIPPER_INDICES]
+        gripper_motion = np.max(np.abs(gripper_delta), axis=1)
+        filtered_indices = (step_filter or {}).get(converted_ep_idx, set())
+        filtered_mask = np.array(
+            [idx in filtered_indices for idx in range(len(gripper_motion))],
+            dtype=bool,
+        )
+        motion_mask = gripper_motion > gripper_threshold
+
+        total_rows += int(len(gripper_motion))
+        gripper_motion_rows += int(np.count_nonzero(motion_mask))
+        filtered_rows += int(np.count_nonzero(filtered_mask))
+        filtered_gripper_motion_rows += int(np.count_nonzero(filtered_mask & motion_mask))
+        kept_gripper_motion_rows += int(np.count_nonzero((~filtered_mask) & motion_mask))
+        if np.any(filtered_mask):
+            max_filtered_gripper_motion = max(
+                max_filtered_gripper_motion,
+                float(np.max(gripper_motion[filtered_mask])),
+            )
+
+    return {
+        "threshold": gripper_threshold,
+        "total_rows": total_rows,
+        "gripper_motion_rows": gripper_motion_rows,
+        "filtered_rows": filtered_rows,
+        "filtered_gripper_motion_rows": filtered_gripper_motion_rows,
+        "kept_gripper_motion_rows": kept_gripper_motion_rows,
+        "max_filtered_gripper_motion": max_filtered_gripper_motion,
+        "passes": filtered_gripper_motion_rows == 0,
+    }
 
 
 def _stats(arr: np.ndarray) -> dict:
@@ -224,6 +273,7 @@ def main() -> None:
     parser.add_argument("--ckpt", type=Path, default=None)
     parser.add_argument("--lerobot-root", type=Path, default=None)
     parser.add_argument("--action-horizon", type=int, default=24)
+    parser.add_argument("--gripper-motion-threshold", type=float, default=1e-4)
     parser.add_argument("--eval-seeds", default="")
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
@@ -285,6 +335,11 @@ def main() -> None:
             "episodes": len(step_filter),
             "filtered_indices": sum(len(indices) for indices in step_filter.values()),
         },
+        "gripper_filter_check": _compute_gripper_filter_diagnostics(
+            episode_paths,
+            step_filter=step_filter,
+            gripper_threshold=args.gripper_motion_threshold,
+        ),
         "trajectory_length": {
             "min": min(lengths),
             "max": max(lengths),
@@ -324,6 +379,8 @@ def main() -> None:
         )
     if bad_diffs:
         raise SystemExit(2)
+    if not result["gripper_filter_check"]["passes"]:
+        raise SystemExit(3)
 
 
 if __name__ == "__main__":
