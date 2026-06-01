@@ -78,12 +78,13 @@ def _load_hdf5_qpos(path: Path) -> np.ndarray:
 def _compute_offsets(
     episode_paths: Iterable[Path],
     action_horizon: int,
+    step_filter: dict[int, set[int]] | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], list[int]]:
     per_step: list[np.ndarray] = []
     per_chunk: list[np.ndarray] = []
     lengths: list[int] = []
 
-    for path in episode_paths:
+    for converted_ep_idx, path in enumerate(episode_paths):
         qpos = _load_hdf5_qpos(path)
         lengths.append(len(qpos))
         if len(qpos) < 2:
@@ -93,7 +94,10 @@ def _compute_offsets(
         # Converter stores action[t] = state[t + 1]. The DreamZero loader
         # samples action offsets [0..H-1] and subtracts state at the chunk
         # anchor, so the physical offsets are qpos[i+1:i+H+1] - qpos[i].
+        filtered_indices = (step_filter or {}).get(converted_ep_idx, set())
         for start in range(max(0, len(qpos) - action_horizon)):
+            if start in filtered_indices:
+                continue
             offsets = qpos[start + 1 : start + action_horizon + 1] - qpos[start]
             if offsets.shape[0] == action_horizon:
                 per_chunk.append(offsets)
@@ -146,6 +150,24 @@ def _load_lerobot_relative_stats(root: Path | None) -> dict:
         return {}
     path = root / "meta" / "relative_stats_dreamzero.json"
     return _read_json(path) if path.exists() else {}
+
+
+def _load_lerobot_step_filter(root: Path | None) -> dict[int, set[int]]:
+    if root is None:
+        return {}
+    path = root / "meta" / "step_filter.jsonl"
+    if not path.exists():
+        return {}
+    result: dict[int, set[int]] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            result[int(item["episode_index"])] = {
+                int(index) for index in item.get("step_indices", [])
+            }
+    return result
 
 
 def _read_seeds(demo_root: Path) -> list[int]:
@@ -211,9 +233,11 @@ def main() -> None:
     if not episode_paths:
         raise FileNotFoundError(f"no episode*.hdf5 files under {demo_root / 'data'}")
 
+    step_filter = _load_lerobot_step_filter(args.lerobot_root)
     step_offsets, chunk_offsets, lengths = _compute_offsets(
         episode_paths,
         action_horizon=args.action_horizon,
+        step_filter=step_filter,
     )
     chunk_stats = {key: _stats(value) for key, value in chunk_offsets.items()}
     step_stats = {key: _stats(value) for key, value in step_offsets.items()}
@@ -254,6 +278,13 @@ def main() -> None:
         "seed_max": max(seeds) if seeds else None,
         "eval_seed_membership": seed_membership,
         "side_counts": _count_sides(demo_root),
+        "step_filter": {
+            "source": str(args.lerobot_root / "meta" / "step_filter.jsonl")
+            if step_filter and args.lerobot_root is not None
+            else None,
+            "episodes": len(step_filter),
+            "filtered_indices": sum(len(indices) for indices in step_filter.values()),
+        },
         "trajectory_length": {
             "min": min(lengths),
             "max": max(lengths),
